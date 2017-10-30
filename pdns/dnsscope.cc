@@ -19,6 +19,8 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
+#include <boost/accumulators/accumulators.hpp>
+#include <boost/accumulators/statistics.hpp>
 #define __FAVOR_BSD
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -35,12 +37,13 @@
 #include <algorithm>
 #include "anadns.hh"
 #include <boost/program_options.hpp>
-
+#include <unordered_set>
 #include <boost/logic/tribool.hpp>
 #include "arguments.hh"
 #include "namespaces.hh"
 #include <deque>
 #include "dnsrecords.hh"
+#include <deque>
 #include "statnode.hh"
 
 namespace po = boost::program_options;
@@ -156,7 +159,7 @@ try
   }
 
   if(files.empty() || g_vm.count("help")) {
-    cerr<<"Syntax: dnsscope filename.pcap"<<endl;
+    cerr<<"Syntax: dnsscope filename.pcap [filenam2.pcap...]"<<endl;
     cout << desc << endl;
     exit(0);
   }
@@ -177,7 +180,7 @@ try
   bool doIPv4 = g_vm["ipv4"].as<bool>();
   bool doIPv6 = g_vm["ipv6"].as<bool>();
   bool doServFailTree = g_vm.count("servfail-tree");
-  int dnserrors=0, bogus=0;
+  int dnserrors=0, parsefail=0;
   typedef map<uint32_t,uint32_t> cumul_t;
   cumul_t cumul;
   unsigned int untracked=0, errorresult=0, reallylate=0, nonRDQueries=0, queries=0;
@@ -191,10 +194,11 @@ try
   time_t lowestTime=2000000000, highestTime=0;
   time_t lastsec=0;
   LiveCounts lastcounts;
-  set<ComboAddress, ComboAddress::addressOnlyLessThan> requestors, recipients, rdnonra;
+  std::unordered_set<ComboAddress, ComboAddress::addressOnlyHash> requestors, recipients, rdnonra;
   typedef vector<pair<time_t, LiveCounts> > pcounts_t;
   pcounts_t pcounts;
   OPTRecordContent::report();
+
   for(unsigned int fno=0; fno < files.size(); ++fno) {
     PcapPacketReader pr(files[fno]);
     PcapPacketWriter* pw=0;
@@ -217,19 +221,23 @@ try
 	      continue;
 	    }
 	  }
-	  MOADNSParser mdp(false, (const char*)pr.d_payload, pr.d_len);
-	  if(haveRDFilter && mdp.d_header.rd != rdFilter) {
+	  uint16_t qtype;
+	  DNSName qname((const char*)pr.d_payload, pr.d_len, 12, false, &qtype);
+	  struct dnsheader header;
+	  memcpy(&header, (struct dnsheader*)pr.d_payload, 12);
+
+	  if(haveRDFilter && header.rd != rdFilter) {
 	    rdFilterMismatch++;
 	    continue;
 	  }
 
-	  if(!mdp.d_header.qr && getEDNSOpts(mdp, &edo)) {
-	    edns++;
-	    if(edo.d_Z & EDNSOpts::DNSSECOK)
-	      dnssecOK++;
-	    if(mdp.d_header.cd)
+	  if(!header.qr) {
+	    //	    edns++;
+	    //if(edo.d_Z & EDNSOpts::DNSSECOK)
+	      //dnssecOK++;
+	    if(header.cd)
 	      dnssecCD++;
-	    if(mdp.d_header.ad)
+	    if(header.ad)
 	      dnssecAD++;
 	  }
 	  
@@ -257,12 +265,10 @@ try
 	  lowestTime=min((time_t)lowestTime,  (time_t)pr.d_pheader.ts.tv_sec);
 	  highestTime=max((time_t)highestTime, (time_t)pr.d_pheader.ts.tv_sec);
 
-	  string name=mdp.d_qname.toString()+"|"+DNSRecordContent::NumberToType(mdp.d_qtype);
-        
-	  QuestionIdentifier qi=QuestionIdentifier::create(pr.getSource(), pr.getDest(), mdp);
+	  QuestionIdentifier qi=QuestionIdentifier::create(pr.getSource(), pr.getDest(), header, qname, qtype);
 
-	  if(!mdp.d_header.qr) { // question
-	    if(!mdp.d_header.rd)
+	  if(!header.qr) { // question
+	    if(!header.rd)
 	      nonRDQueries++;
 	    queries++;
 
@@ -277,14 +283,14 @@ try
 	    qd.d_qcount++;
 	  }
 	  else  {  // answer
-	    rcodes[mdp.d_header.rcode]++;
+	    rcodes[header.rcode]++;
 	    answers++;
-	    if(mdp.d_header.rd && !mdp.d_header.ra) {
+	    if(header.rd && !header.ra) {
 	      rdNonRAAnswers++;
 	      rdnonra.insert(pr.getDest());
 	    }
 	  
-	    if(mdp.d_header.ra) {
+	    if(header.ra) {
 	      ComboAddress rem = pr.getDest();
 	      rem.sin4.sin_port=0;
 	      recipients.insert(rem);	  
@@ -300,34 +306,21 @@ try
 	    if(qd.d_qcount) {
 	      uint32_t usecs= (pr.d_pheader.ts.tv_sec - qd.d_firstquestiontime.tv_sec) * 1000000 +  
 		(pr.d_pheader.ts.tv_usec - qd.d_firstquestiontime.tv_usec) ;
-	      //            cout<<"Took: "<<usecs<<"usec\n";
-	      if(usecs<2049000)
-		cumul[usecs]++;
-	      else
-		reallylate++;
+
+	      cumul[usecs]++;
             
-	      if(mdp.d_header.rcode != 0 && mdp.d_header.rcode!=3) 
+	      if(header.rcode != 0 && header.rcode!=3) 
 		errorresult++;
 	      ComboAddress rem = pr.getDest();
 	      rem.sin4.sin_port=0;
 
 	      if(doServFailTree)
-		root.submit(mdp.d_qname, mdp.d_header.rcode, rem);
+		root.submit(qname, header.rcode, rem);
 	    }
 
 	    if(!qd.d_qcount || qd.d_qcount == qd.d_answercount)
 	      statmap.erase(qi);
 	  }
-
-        
-	}
-	catch(MOADNSException& mde) {
-	  if(verbose)
-	    cout<<"error parsing packet: "<<mde.what()<<endl;
-	  if(pw)
-	    pw->write();
-	  dnserrors++;
-	  continue;
 	}
 	catch(std::exception& e) {
 	  if(verbose)
@@ -335,7 +328,7 @@ try
 
 	  if(pw)
 	    pw->write();
-	  bogus++;
+	  parsefail++;
 	  continue;
 	}
       }
@@ -348,7 +341,7 @@ try
   }
   cout<<"Timespan: "<<(highestTime-lowestTime)/3600.0<<" hours"<<endl;
 
-  cout<<nonDNSIP<<" non-DNS UDP, "<<dnserrors<<" dns decoding errors, "<<bogus<<" bogus packets"<<endl;
+  cout<<nonDNSIP<<" non-DNS UDP, "<<dnserrors<<" dns decoding errors, "<<parsefail<<" packets failed to parse"<<endl;
   cout<<"Ignored fragment packets: "<<fragmented<<endl;
   cout<<"Dropped DNS packets based on recursion-desired filter: "<<rdFilterMismatch<<endl;
   cout<<"DNS IPv4: "<<ipv4DNSPackets<<" packets, IPv6: "<<ipv6DNSPackets<<" packets"<<endl;
@@ -388,26 +381,40 @@ try
   
   typedef map<uint32_t, bool> done_t;
   done_t done;
-  done[50];
-  done[100];
-  done[200];
-  done[300];
-  done[400];
-  done[800];
-  done[1000];
-  done[2000];
-  done[4000];
-  done[8000];
-  done[32000];
-  done[64000];
-  done[256000];
-  done[1024000];
-  done[2048000];
+  for(auto a : {50, 100, 200, 300, 400, 800, 1000, 2000, 4000, 8000, 32000, 64000, 256000, 1024000, 20248000})
+    done[a]=false;
 
   cout.setf(std::ios::fixed);
-  cout.precision(2);
+  cout.precision(3);
   sum=0;
+
+  std::deque<double> percentiles{0.001, 0.01, 0.1, 1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 94, 95, 96, 97, 98, 99, 99.5, 99.6, 99.9, 99.99, 99.999};
+  uint64_t totcumul=0;
+  ofstream histo("histo");
+  for(const auto& c: cumul) {
+    histo<<c.first<<" "<<c.second<<"\n";
+    totcumul += c.second;
+  }
+  histo.flush();
+
+  namespace ba=boost::accumulators;
+  ba::accumulator_set<double, ba::features<ba::tag::mean, ba::tag::variance>, double> acc;
+
+  for(const auto& c: cumul) {
+    if(percentiles.empty())
+      break;
+    sum += c.second;
+
+    acc(c.first, ba::weight=c.second);
+    
+    if(sum > percentiles.front() * totcumul / 100.0) {
+      cout<<percentiles.front()<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<sqrt(ba::variance(acc))<<"\n";
+      percentiles.pop_front();
+      acc=decltype(acc)();
+    }
+  }
   
+  sum=0;
   double lastperc=0, perc=0;
   for(cumul_t::const_iterator i=cumul.begin(); i!=cumul.end(); ++i) {
     sum+=i->second;
