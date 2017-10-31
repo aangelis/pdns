@@ -58,7 +58,7 @@ struct QuestionIdentifier
     }
     ret.d_qname=qname;
     ret.d_qtype=qtype;
-    ret.d_id=header.id;
+    ret.d_id=ntohs(header.id);
     return ret;
   }
 
