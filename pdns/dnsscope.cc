@@ -188,6 +188,7 @@ try
   unsigned int answers=0, nonDNSIP=0, rdFilterMismatch=0;
   unsigned int dnssecOK=0, edns=0;
   unsigned int dnssecCD=0, dnssecAD=0;
+  unsigned int reuses=0;
   typedef map<uint16_t,uint32_t> rcodes_t;
   rcodes_t rcodes;
   
@@ -276,11 +277,12 @@ try
 	    rem.sin4.sin_port=0;
 	    requestors.insert(rem);	  
 
-	    QuestionData& qd=statmap[qi];
+            QuestionData& qd=statmap[qi];
           
 	    if(!qd.d_firstquestiontime.tv_sec)
 	      qd.d_firstquestiontime=pr.d_pheader.ts;
-	    qd.d_qcount++;
+	    if(qd.d_qcount++)
+              reuses++;
 	  }
 	  else  {  // answer
 	    rcodes[header.rcode]++;
@@ -346,6 +348,7 @@ try
   cout<<"Dropped DNS packets based on recursion-desired filter: "<<rdFilterMismatch<<endl;
   cout<<"DNS IPv4: "<<ipv4DNSPackets<<" packets, IPv6: "<<ipv6DNSPackets<<" packets"<<endl;
   cout<<"Questions: "<<queries<<", answers: "<<answers<<endl;
+  cout<<"Reuses of same state entry: "<<reuses<<endl;
   unsigned int unanswered=0;
 
 
@@ -385,10 +388,10 @@ try
     done[a]=false;
 
   cout.setf(std::ios::fixed);
-  cout.precision(3);
+  cout.precision(4);
   sum=0;
 
-  std::deque<double> percentiles{0.001, 0.01, 0.1, 1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 94, 95, 96, 97, 98, 99, 99.5, 99.6, 99.9, 99.99, 99.999};
+  std::deque<double> percentiles{0.001, 0.01, 0.1, 0.2, 0.5, 1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 94, 95, 96, 97, 97.5, 98, 98.5, 99, 99.5, 99.6, 99.9, 99.99, 99.999, 99.9999};
   uint64_t totcumul=0;
   ofstream histo("histo");
   for(const auto& c: cumul) {
@@ -398,22 +401,27 @@ try
   histo.flush();
 
   namespace ba=boost::accumulators;
-  ba::accumulator_set<double, ba::features<ba::tag::mean, ba::tag::variance>, double> acc;
+  ba::accumulator_set<double, ba::features<ba::tag::mean, ba::tag::median, ba::tag::variance>, double> acc;
 
+  ofstream loglog("loglog");
+  uint64_t bincount=0;
   for(const auto& c: cumul) {
     if(percentiles.empty())
       break;
     sum += c.second;
-
+    bincount += c.second;
+    
     acc(c.first, ba::weight=c.second);
     
     if(sum > percentiles.front() * totcumul / 100.0) {
-      cout<<percentiles.front()<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<sqrt(ba::variance(acc))<<"\n";
+      loglog<<percentiles.front()<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<ba::median(acc)<<" "<<sqrt(ba::variance(acc))<<" "<<bincount<<"\n";
       percentiles.pop_front();
       acc=decltype(acc)();
+      bincount=0;
     }
+
   }
-  
+  loglog.flush();
   sum=0;
   double lastperc=0, perc=0;
   for(cumul_t::const_iterator i=cumul.begin(); i!=cumul.end(); ++i) {
