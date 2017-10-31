@@ -123,6 +123,13 @@ void visitor(const StatNode* node, const StatNode::Stat& selfstat, const StatNod
   }
 }
 
+const struct timeval operator-(const struct pdns_timeval& lhs, const struct pdns_timeval& rhs)
+{
+  struct timeval a{lhs.tv_sec, lhs.tv_usec}, b{rhs.tv_sec, rhs.tv_usec};
+  return operator-(a,b);
+}
+
+
 int main(int argc, char** argv)
 try
 {
@@ -134,6 +141,7 @@ try
     ("ipv4", po::value<bool>()->default_value(true), "Process IPv4 packets")
     ("ipv6", po::value<bool>()->default_value(true), "Process IPv6 packets")
     ("servfail-tree", "Figure out subtrees that generate servfails")
+    ("log-histogram", "Write a log-histogram to file 'log-histogram'")
     ("load-stats,l", po::value<string>()->default_value(""), "if set, emit per-second load statistics (questions, answers, outstanding)")
     ("write-failures,w", po::value<string>()->default_value(""), "if set, write weird packets to this PCAP file")
     ("verbose,v", "be verbose");
@@ -269,6 +277,7 @@ try
 	  QuestionIdentifier qi=QuestionIdentifier::create(pr.getSource(), pr.getDest(), header, qname, qtype);
 
 	  if(!header.qr) { // question
+	    //	    cout<<"Query "<<qi<<endl;
 	    if(!header.rd)
 	      nonRDQueries++;
 	    queries++;
@@ -279,12 +288,23 @@ try
 
             QuestionData& qd=statmap[qi];
           
-	    if(!qd.d_firstquestiontime.tv_sec)
+	    if(!qd.d_firstquestiontime.tv_sec) 
 	      qd.d_firstquestiontime=pr.d_pheader.ts;
+	    else {
+	      auto delta=makeFloat(pr.d_pheader.ts - qd.d_firstquestiontime);
+	      //	      cout<<"Reuse of "<<qi<<", delta t="<<delta<<", count="<<qd.d_qcount<<endl;
+	      if(delta > 2.0) {
+		//		cout<<"Resetting old entry for "<<qi<<", too old"<<endl;
+		qd.d_qcount=0;
+		qd.d_answercount=0;
+		qd.d_firstquestiontime=pr.d_pheader.ts;
+	      }
+	    }
 	    if(qd.d_qcount++)
               reuses++;
 	  }
 	  else  {  // answer
+	    //	    cout<<"Response "<<qi<<endl;
 	    rcodes[header.rcode]++;
 	    answers++;
 	    if(header.rd && !header.ra) {
@@ -300,8 +320,10 @@ try
 
 	    QuestionData& qd=statmap[qi];
 
-	    if(!qd.d_qcount)
+	    if(!qd.d_qcount) {
+	      //	      cout<<"Untracked answer: "<<qi<<endl;
 	      untracked++;
+	    }
 
 	    qd.d_answercount++;
 
@@ -309,6 +331,7 @@ try
 	      uint32_t usecs= (pr.d_pheader.ts.tv_sec - qd.d_firstquestiontime.tv_sec) * 1000000 +  
 		(pr.d_pheader.ts.tv_usec - qd.d_firstquestiontime.tv_usec) ;
 
+	      //	      cout<<"Usecs for "<<qi<<": "<<usecs<<endl;
 	      cumul[usecs]++;
             
 	      if(header.rcode != 0 && header.rcode!=3) 
@@ -320,8 +343,13 @@ try
 		root.submit(qname, header.rcode, rem);
 	    }
 
-	    if(!qd.d_qcount || qd.d_qcount == qd.d_answercount)
+	    if(!qd.d_qcount || qd.d_qcount == qd.d_answercount) {
+	      //	      cout<<"Clearing state for "<<qi<<endl<<endl;
 	      statmap.erase(qi);
+	    }
+	    else
+	      ;//	      cout<<"State for qi remains open, qcount="<<qd.d_qcount<<", answercount="<<qd.d_answercount<<endl;
+	     
 	  }
 	}
 	catch(std::exception& e) {
@@ -341,6 +369,14 @@ try
     cout<<"PCAP contained "<<pr.d_correctpackets<<" correct packets, "<<pr.d_runts<<" runts, "<< pr.d_oversized<<" oversize, "<<pr.d_nonetheripudp<<" non-UDP.\n";
 
   }
+
+  /*
+  cout<<"Open when done: "<<endl;
+  for(const auto& a : statmap) {
+    cout<<a.first<<": qcount="<<a.second.d_qcount<<", answercount="<<a.second.d_answercount<<endl;
+  }
+  */
+  
   cout<<"Timespan: "<<(highestTime-lowestTime)/3600.0<<" hours"<<endl;
 
   cout<<nonDNSIP<<" non-DNS UDP, "<<dnserrors<<" dns decoding errors, "<<parsefail<<" packets failed to parse"<<endl;
@@ -384,7 +420,7 @@ try
   
   typedef map<uint32_t, bool> done_t;
   done_t done;
-  for(auto a : {50, 100, 200, 300, 400, 800, 1000, 2000, 4000, 8000, 32000, 64000, 256000, 1024000, 20248000})
+  for(auto a : {50, 100, 200, 300, 400, 800, 1000, 2000, 4000, 8000, 32000, 64000, 256000, 1024000, 2048000})
     done[a]=false;
 
   cout.setf(std::ios::fixed);
@@ -403,25 +439,26 @@ try
   namespace ba=boost::accumulators;
   ba::accumulator_set<double, ba::features<ba::tag::mean, ba::tag::median, ba::tag::variance>, double> acc;
 
-  ofstream loglog("loglog");
-  uint64_t bincount=0;
-  for(const auto& c: cumul) {
-    if(percentiles.empty())
-      break;
-    sum += c.second;
-    bincount += c.second;
-    
-    acc(c.first, ba::weight=c.second);
-    
-    if(sum > percentiles.front() * totcumul / 100.0) {
-      loglog<<percentiles.front()<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<ba::median(acc)<<" "<<sqrt(ba::variance(acc))<<" "<<bincount<<"\n";
-      percentiles.pop_front();
-      acc=decltype(acc)();
-      bincount=0;
+  if(g_vm.count("log-histogram")) {
+    ofstream loglog("log-histogram");
+    loglog<<"# slow-percentile usec-latency-max usec-latency-mean usec-latency-median usec-latency-stddev num-queries"<<endl;
+    uint64_t bincount=0;
+    for(const auto& c: cumul) {
+      if(percentiles.empty())
+	break;
+      sum += c.second;
+      bincount += c.second;
+      
+      acc(c.first, ba::weight=c.second);
+      
+      if(sum > percentiles.front() * totcumul / 100.0) {
+	loglog<<(100.0-percentiles.front())<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<ba::median(acc)<<" "<<sqrt(ba::variance(acc))<<" "<<bincount<<"\n";
+	percentiles.pop_front();
+	acc=decltype(acc)();
+	bincount=0;
+      }
     }
-
   }
-  loglog.flush();
   sum=0;
   double lastperc=0, perc=0;
   for(cumul_t::const_iterator i=cumul.begin(); i!=cumul.end(); ++i) {
