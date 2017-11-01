@@ -19,12 +19,12 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
-#include <boost/accumulators/accumulators.hpp>
-#include <boost/accumulators/statistics.hpp>
 #define __FAVOR_BSD
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+#include "histog.hh"
+
 #include "statbag.hh"
 #include "dnspcap.hh"
 #include "dnsparser.hh"
@@ -45,6 +45,7 @@
 #include "dnsrecords.hh"
 #include <deque>
 #include "statnode.hh"
+
 
 namespace po = boost::program_options;
 po::variables_map g_vm;
@@ -427,37 +428,9 @@ try
   cout.precision(4);
   sum=0;
 
-  std::deque<double> percentiles{0.001, 0.01, 0.1, 0.2, 0.5, 1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 94, 95, 96, 97, 97.5, 98, 98.5, 99, 99.5, 99.6, 99.9, 99.99, 99.999, 99.9999};
-  uint64_t totcumul=0;
-  ofstream histo("histo");
-  for(const auto& c: cumul) {
-    histo<<c.first<<" "<<c.second<<"\n";
-    totcumul += c.second;
-  }
-  histo.flush();
-
-  namespace ba=boost::accumulators;
-  ba::accumulator_set<double, ba::features<ba::tag::mean, ba::tag::median, ba::tag::variance>, double> acc;
-
   if(g_vm.count("log-histogram")) {
     ofstream loglog("log-histogram");
-    loglog<<"# slow-percentile usec-latency-max usec-latency-mean usec-latency-median usec-latency-stddev num-queries"<<endl;
-    uint64_t bincount=0;
-    for(const auto& c: cumul) {
-      if(percentiles.empty())
-	break;
-      sum += c.second;
-      bincount += c.second;
-      
-      acc(c.first, ba::weight=c.second);
-      
-      if(sum > percentiles.front() * totcumul / 100.0) {
-	loglog<<(100.0-percentiles.front())<<" "<<c.first<<" "<<ba::mean(acc)<<" "<<ba::median(acc)<<" "<<sqrt(ba::variance(acc))<<" "<<bincount<<"\n";
-	percentiles.pop_front();
-	acc=decltype(acc)();
-	bincount=0;
-      }
-    }
+    writeLogHistogramFile(cumul, loglog);
   }
   sum=0;
   double lastperc=0, perc=0;
